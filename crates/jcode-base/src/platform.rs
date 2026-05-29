@@ -78,8 +78,10 @@ pub fn raise_nofile_limit_best_effort(minimum_soft_limit: u64) {
             return;
         }
 
-        let current: u64 = limit.rlim_cur;
-        let hard: u64 = limit.rlim_max;
+        // libc::rlim_t is u64 on Linux/macOS but i64 on FreeBSD; cast
+        // unconditionally since rlimit values are always non-negative.
+        let current: u64 = limit.rlim_cur as u64;
+        let hard: u64 = limit.rlim_max as u64;
         let Some(desired) = desired_nofile_soft_limit(current, hard, minimum_soft_limit) else {
             return;
         };
