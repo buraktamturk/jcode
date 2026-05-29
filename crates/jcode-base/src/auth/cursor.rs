@@ -230,11 +230,6 @@ fn find_cursor_vscdb() -> Result<PathBuf> {
 
 /// Platform-specific candidate paths for Cursor's state.vscdb.
 fn cursor_vscdb_paths() -> Vec<PathBuf> {
-    #[cfg(target_os = "linux")]
-    let relatives = [
-        ".config/Cursor/User/globalStorage/state.vscdb",
-        ".config/cursor/User/globalStorage/state.vscdb",
-    ];
     #[cfg(target_os = "macos")]
     let relatives = [
         "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
@@ -244,6 +239,12 @@ fn cursor_vscdb_paths() -> Vec<PathBuf> {
     let relatives = [
         "AppData/Roaming/Cursor/User/globalStorage/state.vscdb",
         "AppData/Roaming/cursor/User/globalStorage/state.vscdb",
+    ];
+    // Linux, FreeBSD, and other Unix-like systems share the XDG path convention.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let relatives = [
+        ".config/Cursor/User/globalStorage/state.vscdb",
+        ".config/cursor/User/globalStorage/state.vscdb",
     ];
 
     relatives

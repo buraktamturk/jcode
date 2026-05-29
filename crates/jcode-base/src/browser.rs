@@ -682,7 +682,7 @@ fn register_windows_native_host_manifest(manifest_path: &std::path::Path) -> Res
 }
 
 fn native_messaging_hosts_dir() -> Result<PathBuf> {
-    #[cfg(target_os = "linux")]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let home = dirs::home_dir().context("No home directory")?;
         Ok(home.join(".mozilla").join("native-messaging-hosts"))
@@ -702,10 +702,6 @@ fn native_messaging_hosts_dir() -> Result<PathBuf> {
         // We'll write the manifest file to a known location and handle registry separately
         let appdata = dirs::data_dir().context("No app data directory")?;
         Ok(appdata.join("Mozilla").join("NativeMessagingHosts"))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        Err(anyhow::anyhow!("Unsupported platform for native messaging"))
     }
 }
 
@@ -847,7 +843,8 @@ async fn install_extension() -> Result<String> {
         .map_err(|_| anyhow::anyhow!("Could not convert XPI path to file URL: {}", xpi.display()))?
         .to_string();
 
-    #[cfg(target_os = "linux")]
+    // xdg-open is available on Linux, FreeBSD, and most Unix-like systems
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = tokio::process::Command::new("xdg-open")
             .arg(&xpi_url)
