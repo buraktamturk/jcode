@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net",
 futures = "0.3"
 async-trait = "0.1"
 
-# HTTP client (reqwest: general purpose; rquest: browser-impersonating
+# HTTP client (reqwest: general purpose; wreq: browser-impersonating
 # client using BoringSSL for sites that TLS-fingerprint, e.g. DuckDuckGo, Bing)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls-native-roots"] }
 wreq = { version = "5.3", default-features = false, features = ["json", "stream", "webpki-roots"] }
