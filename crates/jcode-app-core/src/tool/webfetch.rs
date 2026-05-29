@@ -2,6 +2,7 @@ use super::{Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
+use wreq_util::Emulation;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -12,12 +13,19 @@ const MAX_TIMEOUT: u64 = 120;
 
 pub struct WebFetchTool {
     client: reqwest::Client,
+    /// Browser-impersonating client for sites that do TLS fingerprinting
+    /// (search engines, etc.). Uses BoringSSL to mimic Chrome's TLS handshake.
+    impersonate_client: wreq::Client,
 }
 
 impl WebFetchTool {
     pub fn new() -> Self {
         Self {
             client: crate::provider::shared_http_client(),
+            impersonate_client: wreq::Client::builder()
+                .emulation(Emulation::Chrome131)
+                .build()
+                .expect("failed to build wreq client for webfetch"),
         }
     }
 }
@@ -75,61 +83,22 @@ impl Tool for WebFetchTool {
         let timeout = params.timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT);
         let format = params.format.as_deref().unwrap_or("markdown");
 
-        let response = self
-            .client
-            .get(&params.url)
-            .header(
-                reqwest::header::USER_AGENT,
-                "Mozilla/5.0 (compatible; JCode/1.0)",
-            )
-            .timeout(Duration::from_secs(timeout))
-            .send()
-            .await?;
+        // Use browser-impersonating client for sites known to TLS-fingerprint
+        let hostname = params
+            .url
+            .strip_prefix("https://")
+            .or_else(|| params.url.strip_prefix("http://"))
+            .and_then(|s| s.split('/').next())
+            .unwrap_or("");
+        let use_impersonate = hostname.ends_with("duckduckgo.com")
+            || hostname.ends_with("bing.com")
+            || hostname.ends_with("google.com");
 
-        let status = response.status();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!("HTTP error: {}", status));
-        }
-
-        // Check content length
-        if let Some(len) = response.content_length()
-            && len as usize > MAX_SIZE
-        {
-            return Err(anyhow::anyhow!(
-                "Response too large: {} bytes (max {} bytes)",
-                len,
-                MAX_SIZE
-            ));
-        }
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let mut body_bytes = Vec::new();
-        let mut truncated = false;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let remaining = MAX_SIZE.saturating_sub(body_bytes.len());
-            if chunk.len() > remaining {
-                body_bytes.extend_from_slice(&chunk[..remaining]);
-                truncated = true;
-                break;
-            }
-            body_bytes.extend_from_slice(&chunk);
-        }
-
-        let mut body = String::from_utf8_lossy(&body_bytes).into_owned();
-        if truncated {
-            body.push_str(&format!(
-                "...\n\n(truncated, showing first {} bytes)",
-                MAX_SIZE
-            ));
-        }
+        let (content_type, body, _truncated) = if use_impersonate {
+            self.fetch_with_impersonate(&params.url, timeout).await?
+        } else {
+            self.fetch_with_reqwest(&params.url, timeout).await?
+        };
 
         // Format output
         let output = match format {
@@ -157,6 +126,136 @@ impl Tool for WebFetchTool {
             output.len(),
             output
         )))
+    }
+}
+
+impl WebFetchTool {
+    /// Fetch using the standard reqwest client (no impersonation)
+    async fn fetch_with_reqwest(
+        &self,
+        url: &str,
+        timeout_secs: u64,
+    ) -> Result<(String, String, bool)> {
+        let response = self
+            .client
+            .get(url)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (compatible; JCode/1.0)",
+            )
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await?;
+
+        Self::read_response_reqwest(response).await
+    }
+
+    /// Fetch using the browser-impersonating wreq client
+    async fn fetch_with_impersonate(
+        &self,
+        url: &str,
+        timeout_secs: u64,
+    ) -> Result<(String, String, bool)> {
+        let response = self
+            .impersonate_client
+            .get(url)
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await?;
+
+        Self::read_response_wreq(response).await
+    }
+
+    /// Read a reqwest response into (content_type, body, truncated)
+    async fn read_response_reqwest(
+        response: reqwest::Response,
+    ) -> Result<(String, String, bool)> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!("HTTP error: {}", status));
+        }
+        if let Some(len) = response.content_length()
+            && len as usize > MAX_SIZE
+        {
+            return Err(anyhow::anyhow!(
+                "Response too large: {} bytes (max {} bytes)",
+                len,
+                MAX_SIZE
+            ));
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let mut body_bytes = Vec::new();
+        let mut truncated = false;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let remaining = MAX_SIZE.saturating_sub(body_bytes.len());
+            if chunk.len() > remaining {
+                body_bytes.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+        let mut body = String::from_utf8_lossy(&body_bytes).into_owned();
+        if truncated {
+            body.push_str(&format!(
+                "...\n\n(truncated, showing first {} bytes)",
+                MAX_SIZE
+            ));
+        }
+        Ok((content_type, body, truncated))
+    }
+
+    /// Read a wreq response into (content_type, body, truncated)
+    async fn read_response_wreq(
+        response: wreq::Response,
+    ) -> Result<(String, String, bool)> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!("HTTP error: {}", status));
+        }
+        if let Some(len) = response.content_length()
+            && len as usize > MAX_SIZE
+        {
+            return Err(anyhow::anyhow!(
+                "Response too large: {} bytes (max {} bytes)",
+                len,
+                MAX_SIZE
+            ));
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let mut body_bytes = Vec::new();
+        let mut truncated = false;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let remaining = MAX_SIZE.saturating_sub(body_bytes.len());
+            if chunk.len() > remaining {
+                body_bytes.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+        let mut body = String::from_utf8_lossy(&body_bytes).into_owned();
+        if truncated {
+            body.push_str(&format!(
+                "...\n\n(truncated, showing first {} bytes)",
+                MAX_SIZE
+            ));
+        }
+        Ok((content_type, body, truncated))
     }
 }
 

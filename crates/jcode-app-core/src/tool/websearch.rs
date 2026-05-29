@@ -2,18 +2,26 @@ use super::{Tool, ToolContext, ToolOutput};
 use crate::config::WebSearchEngine;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use wreq_util::Emulation;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// Web search using DuckDuckGo or Bing (HTML scraping, with optional Bing API)
 pub struct WebSearchTool {
     client: reqwest::Client,
+    /// Browser-impersonating client for sites that do TLS fingerprinting.
+    /// Uses BoringSSL to mimic Chrome's TLS handshake, bypassing bot detection.
+    impersonate_client: wreq::Client,
 }
 
 impl WebSearchTool {
     pub fn new() -> Self {
         Self {
             client: crate::provider::shared_http_client(),
+            impersonate_client: wreq::Client::builder()
+                .emulation(Emulation::Chrome131)
+                .build()
+                .expect("failed to build wreq client for websearch"),
         }
     }
 }
@@ -258,13 +266,10 @@ impl WebSearchTool {
             urlencoding::encode(query)
         );
 
+        // Use browser-impersonating client to bypass TLS fingerprinting
         let response = self
-            .client
+            .impersonate_client
             .get(&url)
-            .header(
-                reqwest::header::USER_AGENT,
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-            )
             .send()
             .await?;
 
@@ -348,13 +353,10 @@ impl WebSearchTool {
             urlencoding::encode(market)
         );
 
+        // Use browser-impersonating client to bypass TLS fingerprinting
         let response = self
-            .client
+            .impersonate_client
             .get(&url)
-            .header(
-                reqwest::header::USER_AGENT,
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-            )
             .send()
             .await?;
 
