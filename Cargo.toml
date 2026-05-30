@@ -304,6 +304,15 @@ debug = 0
 incremental = true
 codegen-units = 256
 
+[patch.crates-io]
+# Patch azure_identity and typespec_client_core to use rustls instead of
+# native-tls for reqwest. The upstream crates hardcode reqwest/native-tls in
+# their dependencies, which pulls in openssl-sys and conflicts with BoringSSL
+# (from wreq) at link time on platforms like FreeBSD where both TLS libraries
+# coexist in the same binary.
+azure_identity = { path = "patches/azure_identity-0.24.0" }
+typespec_client_core = { path = "patches/typespec_client_core-0.3.0" }
+
 [dev-dependencies]
 async-stream = "0.3"
 # Enables the downstream test-support helpers (storage::lock_test_env,
