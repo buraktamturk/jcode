@@ -658,6 +658,8 @@ fn make_provider() -> OpenRouterProvider {
         provider_routing: Arc::new(RwLock::new(ProviderRouting::default())),
         provider_pin: Arc::new(Mutex::new(None)),
         endpoints_cache: Arc::new(RwLock::new(HashMap::new())),
+        model_api_formats: HashMap::new(),
+        default_api_format: crate::config::ModelApiFormat::default(),
     }
 }
 
@@ -684,6 +686,8 @@ fn make_custom_compatible_provider() -> OpenRouterProvider {
         provider_routing: Arc::new(RwLock::new(ProviderRouting::default())),
         provider_pin: Arc::new(Mutex::new(None)),
         endpoints_cache: Arc::new(RwLock::new(HashMap::new())),
+        model_api_formats: HashMap::new(),
+        default_api_format: crate::config::ModelApiFormat::default(),
     }
 }
 
@@ -1214,6 +1218,7 @@ fn named_openai_compatible_model_context_window_overrides_default() {
             id: "custom-long-context".to_string(),
             context_window: Some(512_000),
             input: Vec::new(),
+            api: None,
         }],
         ..Default::default()
     };
