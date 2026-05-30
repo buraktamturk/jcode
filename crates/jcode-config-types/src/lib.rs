@@ -285,6 +285,20 @@ pub enum NamedProviderAuth {
     None,
 }
 
+/// API request/response format for named provider models.
+/// Per-model overrides in [`NamedProviderModelConfig::api`] take precedence
+/// over the provider-level default in [`NamedProviderConfig::api`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelApiFormat {
+    /// OpenAI chat completions (`/chat/completions`).
+    #[default]
+    Chat,
+    /// Anthropic messages (`/v1/messages`).
+    #[serde(alias = "anthropic", alias = "anthropic-compatible")]
+    Messages,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct NamedProviderModelConfig {
@@ -300,6 +314,10 @@ pub struct NamedProviderModelConfig {
     pub context_window: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<String>,
+    /// Override the API request/response format for this specific model.
+    /// When `None`, falls back to the provider-level [`NamedProviderConfig::api`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ModelApiFormat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,7 +326,10 @@ pub struct NamedProviderConfig {
     #[serde(rename = "type")]
     pub provider_type: NamedProviderType,
     pub base_url: String,
-    pub api: Option<String>,
+    /// Default API request/response format for all models on this provider.
+    /// Individual models can override via [`NamedProviderModelConfig::api`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ModelApiFormat>,
     pub auth: NamedProviderAuth,
     pub auth_header: Option<String>,
     pub api_key_env: Option<String>,

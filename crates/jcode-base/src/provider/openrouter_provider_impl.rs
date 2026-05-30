@@ -12,6 +12,30 @@ impl Provider for OpenRouterProvider {
         _resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
         let model = self.model.read().await.clone();
+        // Defense-in-depth: strip any lingering "{profile_id}:" prefix that
+        // may have leaked into the model field through session restore or
+        // TUI model switch. The API must never receive the prefixed form.
+        let model = if let Some(profile_id) = self.profile_id.as_deref() {
+            let prefix = format!("{}:", profile_id);
+            if let Some(stripped) = model.strip_prefix(&prefix) {
+                crate::logging::warn(&format!(
+                    "Stripped provider prefix '{}' from model ID before API request",
+                    prefix
+                ));
+                stripped.to_string()
+            } else {
+                model
+            }
+        } else {
+            model
+        };
+
+        // Branch: if this model uses the Anthropic Messages API format,
+        // delegate to the Anthropic-format request builder + SSE parser.
+        if self.model_api_format(&model) == crate::config::ModelApiFormat::Messages {
+            return self.complete_anthropic_format(messages, tools, system, &model).await;
+        }
+
         let reasoning_effort = self.reasoning_effort();
         let thinking_override = Self::thinking_override();
         let thinking_enabled = thinking_override.or_else(|| {
@@ -1066,6 +1090,160 @@ impl Provider for OpenRouterProvider {
             provider_pin: Arc::new(Mutex::new(None)),
             endpoints_cache: Arc::clone(&self.endpoints_cache),
             endpoint_refresh: Arc::clone(&self.endpoint_refresh),
+            model_api_formats: self.model_api_formats.clone(),
+            default_api_format: self.default_api_format,
         })
+    }
+}
+
+impl OpenRouterProvider {
+    /// Complete a request using the Anthropic Messages API format.
+    ///
+    /// This is used when a named provider model has `api = "messages"` configured,
+    /// meaning the upstream endpoint expects the Anthropic `/v1/messages` schema
+    /// rather than OpenAI `/chat/completions`.
+    async fn complete_anthropic_format(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system: &str,
+        model: &str,
+    ) -> Result<EventStream> {
+        // -- Build Anthropic-format messages --
+        let mut api_messages: Vec<serde_json::Value> = Vec::new();
+
+        for msg in messages {
+            let role = match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+
+            let mut content_parts: Vec<serde_json::Value> = Vec::new();
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text, .. } => {
+                        content_parts.push(serde_json::json!({
+                            "type": "text",
+                            "text": text
+                        }));
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        content_parts.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": crate::message::sanitize_tool_id(id),
+                            "name": name,
+                            "input": if input.is_object() { input.clone() } else { serde_json::json!({}) },
+                        }));
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        content_parts.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": crate::message::sanitize_tool_id(tool_use_id),
+                            "content": content,
+                            "is_error": is_error.unwrap_or(false),
+                        }));
+                    }
+                    ContentBlock::Image { media_type, data } => {
+                        content_parts.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data,
+                            }
+                        }));
+                    }
+                    _ => {} // Skip unsupported block types
+                }
+            }
+
+            if !content_parts.is_empty() {
+                api_messages.push(serde_json::json!({
+                    "role": role,
+                    "content": content_parts,
+                }));
+            }
+        }
+
+        // Merge consecutive messages of the same role (Anthropic API requirement)
+        let mut merged: Vec<serde_json::Value> = Vec::new();
+        for msg in api_messages {
+            if let Some(last) = merged.last_mut()
+                && last.get("role") == msg.get("role")
+                && let Some(last_content) = last.get_mut("content")
+                && let Some(msg_content) = msg.get("content")
+                && let (Some(last_arr), Some(msg_arr)) =
+                    (last_content.as_array_mut(), msg_content.as_array())
+            {
+                last_arr.extend(msg_arr.iter().cloned());
+                continue;
+            }
+            merged.push(msg);
+        }
+        api_messages = merged;
+
+        // -- Build Anthropic-format tools --
+        let api_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect();
+
+        // -- Build request body --
+        let max_tokens = self.max_tokens.unwrap_or(8192);
+        let mut request = serde_json::json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": api_messages,
+            "stream": true,
+        });
+
+        if !system.is_empty() {
+            request["system"] = serde_json::json!(system);
+        }
+
+        if !api_tools.is_empty() {
+            request["tools"] = serde_json::json!(api_tools);
+        }
+
+        crate::logging::info(&format!(
+            "Anthropic-compatible transport: HTTPS/SSE (model: {}, endpoint: {}/messages)",
+            model, self.api_base
+        ));
+
+        let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let client = self.client.clone();
+        let api_base = self.api_base.clone();
+        let auth = self.auth.clone();
+        let request_for_stream = request;
+        let model_for_stream = model.to_string();
+
+        tokio::spawn(async move {
+            if tx
+                .send(Ok(StreamEvent::ConnectionType {
+                    connection: "https/sse".to_string(),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            super::openrouter_sse_stream::run_anthropic_format_stream_with_retries(
+                client,
+                api_base,
+                auth,
+                request_for_stream,
+                tx,
+                model_for_stream,
+            )
+            .await;
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
     }
 }

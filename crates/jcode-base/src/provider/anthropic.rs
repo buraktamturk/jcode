@@ -1968,12 +1968,12 @@ fn anthropic_beta_header_with_thinking(base: &str, thinking_enabled: bool) -> St
 }
 
 /// Accumulator for tool_use blocks (input comes in chunks)
-struct ToolUseAccumulator {
-    input_json: String,
+pub(crate) struct ToolUseAccumulator {
+    pub(crate) input_json: String,
 }
 
 /// Parse a single SSE event from the buffer
-fn parse_sse_event(buffer: &mut String) -> Option<SseEvent> {
+pub(crate) fn parse_sse_event(buffer: &mut String) -> Option<SseEvent> {
     // Look for complete event (ends with double newline)
     let event_end = buffer.find("\n\n")?;
     let event_str = buffer[..event_end].to_string();
@@ -1998,14 +1998,14 @@ fn parse_sse_event(buffer: &mut String) -> Option<SseEvent> {
 }
 
 /// SSE event from the stream
-struct SseEvent {
-    event_type: String,
-    data: String,
+pub(crate) struct SseEvent {
+    pub(crate) event_type: String,
+    pub(crate) data: String,
 }
 
 /// Process an SSE event and return StreamEvents if applicable
 #[allow(clippy::too_many_arguments)]
-fn process_sse_event(
+pub(crate) fn process_sse_event(
     event: &SseEvent,
     current_tool_use: &mut Option<ToolUseAccumulator>,
     current_thinking_block: &mut bool,

@@ -180,6 +180,7 @@ pub(crate) fn configure_provider_profile(
             id: model.clone(),
             context_window: options.context_window,
             input: Vec::new(),
+            api: None,
         }],
     };
 

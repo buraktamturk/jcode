@@ -838,6 +838,11 @@ pub struct OpenRouterProvider {
     endpoints_cache: Arc<RwLock<EndpointsCache>>,
     /// Background refresh state for per-model endpoint data
     endpoint_refresh: Arc<Mutex<EndpointRefreshTracker>>,
+    /// Per-model API format overrides (model_id → format).
+    /// When absent for a model, falls back to `default_api_format`.
+    model_api_formats: HashMap<String, crate::config::ModelApiFormat>,
+    /// Default API format for models not in `model_api_formats`.
+    default_api_format: crate::config::ModelApiFormat,
 }
 
 impl OpenRouterProvider {
@@ -877,6 +882,17 @@ impl OpenRouterProvider {
                 Some("max".to_string())
             }
         }
+    }
+
+    /// Return the API format to use for the given model.
+    /// Per-model overrides take precedence; otherwise falls back to the
+    /// provider-level default.
+    pub(crate) fn model_api_format(&self, model: &str) -> crate::config::ModelApiFormat {
+        let key = model.trim().to_ascii_lowercase();
+        self.model_api_formats
+            .get(&key)
+            .copied()
+            .unwrap_or(self.default_api_format)
     }
 
     fn normalize_unified_reasoning_effort(raw: &str) -> Option<String> {
@@ -1023,6 +1039,20 @@ impl OpenRouterProvider {
                     .map(|limit| (id.to_ascii_lowercase(), limit))
             })
             .collect::<HashMap<_, _>>();
+        let model_api_formats: HashMap<String, crate::config::ModelApiFormat> = profile
+            .models
+            .iter()
+            .filter_map(|model| {
+                let id = model.id.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                model.api.map(|api| (id.to_ascii_lowercase(), api))
+            })
+            .collect();
+        let default_api_format = profile
+            .api
+            .unwrap_or_default();
         Ok(Self {
             client: crate::provider::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
@@ -1050,6 +1080,8 @@ impl OpenRouterProvider {
             provider_pin: Arc::new(Mutex::new(None)),
             endpoints_cache: Arc::new(RwLock::new(HashMap::new())),
             endpoint_refresh: Arc::new(Mutex::new(EndpointRefreshTracker::default())),
+            model_api_formats,
+            default_api_format,
         })
     }
 
@@ -1163,6 +1195,8 @@ impl OpenRouterProvider {
             provider_pin: Arc::new(Mutex::new(None)),
             endpoints_cache: Arc::new(RwLock::new(HashMap::new())),
             endpoint_refresh: Arc::new(Mutex::new(EndpointRefreshTracker::default())),
+            model_api_formats: HashMap::new(),
+            default_api_format: crate::config::ModelApiFormat::default(),
         })
     }
 
@@ -1388,6 +1422,8 @@ impl OpenRouterProvider {
                 provider_pin: Arc::new(Mutex::new(None)),
                 endpoints_cache,
                 endpoint_refresh: Arc::clone(&refresh_state),
+                model_api_formats: HashMap::new(),
+                default_api_format: crate::config::ModelApiFormat::default(),
             };
 
             match provider.fetch_endpoints(&model_name).await {

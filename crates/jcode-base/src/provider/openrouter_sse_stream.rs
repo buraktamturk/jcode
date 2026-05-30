@@ -232,6 +232,234 @@ fn is_retryable_error(error_str: &str) -> bool {
         || error_str.contains("overloaded")
 }
 
+// ============================================================================
+// Anthropic Messages API format streaming
+// ============================================================================
+
+/// Retry + stream for Anthropic Messages API format endpoints.
+/// Uses the same retry logic as the OpenAI path but builds a different
+/// URL, headers, and parses with the Anthropic SSE event format.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream helpers thread transport, auth, request, event channel explicitly"
+)]
+pub(super) async fn run_anthropic_format_stream_with_retries(
+    client: Client,
+    api_base: String,
+    auth: ProviderAuth,
+    request: Value,
+    tx: mpsc::Sender<Result<StreamEvent>>,
+    model: String,
+) {
+    let mut last_error = None;
+
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            let delay = RETRY_BASE_DELAY_MS * (1 << (attempt - 1));
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            crate::logging::info(&format!(
+                "Retrying Anthropic-format API request using {} (attempt {}/{})",
+                auth.label(),
+                attempt + 1,
+                MAX_RETRIES
+            ));
+        }
+
+        crate::logging::info(&format!(
+            "Anthropic-format stream attempt {}/{} (model: {}, endpoint: {}/messages, auth: {})",
+            attempt + 1,
+            MAX_RETRIES,
+            model,
+            api_base,
+            auth.label()
+        ));
+
+        match stream_anthropic_format_response(
+            client.clone(),
+            api_base.clone(),
+            auth.clone(),
+            request.clone(),
+            tx.clone(),
+            &model,
+        )
+        .await
+        {
+            Ok(()) => return,
+            Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
+                    crate::logging::info(&format!(
+                        "Transient Anthropic-format error, will retry: {}",
+                        e
+                    ));
+                    last_error = Some(e);
+                    continue;
+                }
+
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+
+    if let Some(e) = last_error {
+        let _ = tx
+            .send(Err(anyhow::anyhow!(
+                "Failed after {} retries: {}",
+                MAX_RETRIES,
+                e
+            )))
+            .await;
+    }
+}
+
+/// Send a request to an Anthropic Messages API endpoint and parse the SSE stream
+/// using the Anthropic event format (content_block_start/delta/stop, message_start/delta/stop).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream helpers thread transport, auth, request, event channel explicitly"
+)]
+async fn stream_anthropic_format_response(
+    client: Client,
+    api_base: String,
+    auth: ProviderAuth,
+    request: Value,
+    tx: mpsc::Sender<Result<StreamEvent>>,
+    model: &str,
+) -> Result<()> {
+    use crate::message::ConnectionPhase;
+
+    let _ = tx
+        .send(Ok(StreamEvent::ConnectionPhase {
+            phase: ConnectionPhase::Connecting,
+        }))
+        .await;
+
+    let connect_start = std::time::Instant::now();
+
+    // Build the URL: {api_base}/messages
+    // If the base already ends with /v1, we get /v1/messages which is correct.
+    // If the base is just the host, we append /messages.
+    let base = api_base.trim_end_matches('/');
+    let url = format!("{}/messages", base);
+
+    let mut req = auth
+        .apply(
+            client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .header("Accept", "text/event-stream"),
+        )
+        .await?;
+
+    let response = req
+        .json(&request)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to send Anthropic-format request\n  endpoint: {}\n  model: {}\n  auth: {}",
+                url,
+                model,
+                auth.label()
+            )
+        })?;
+
+    let connect_ms = connect_start.elapsed().as_millis();
+    crate::logging::info(&format!(
+        "HTTP connection established in {}ms (status={})",
+        connect_ms,
+        response.status()
+    ));
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = crate::util::http_error_body(response, "HTTP error").await;
+        anyhow::bail!(
+            "Anthropic-format request failed\n  endpoint: {}\n  model: {}\n  auth: {}\n  status: {}\n  response: {}",
+            url,
+            model,
+            auth.label(),
+            status,
+            body
+        );
+    }
+
+    let _ = tx
+        .send(Ok(StreamEvent::ConnectionPhase {
+            phase: ConnectionPhase::WaitingForResponse,
+        }))
+        .await;
+
+    // Parse the Anthropic SSE stream using the shared parser
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut current_tool_use: Option<crate::provider::anthropic::ToolUseAccumulator> = None;
+    let mut current_thinking_block = false;
+    let mut input_tokens: Option<u64> = None;
+    let mut output_tokens: Option<u64> = None;
+    let mut cache_read_input_tokens: Option<u64> = None;
+    let mut cache_creation_input_tokens: Option<u64> = None;
+
+    let sse_chunk_timeout = crate::provider::sse_timeout::chunk_timeout(180);
+
+    loop {
+        let chunk = match tokio::time::timeout(sse_chunk_timeout, stream.next()).await {
+            Ok(Some(chunk_result)) => chunk_result.context("Error reading Anthropic-format stream chunk")?,
+            Ok(None) => break,
+            Err(_) => {
+                let secs = sse_chunk_timeout.as_secs();
+                anyhow::bail!(
+                    "Anthropic-format stream timeout\n  endpoint: {}\n  model: {}\n  auth: {}\n  timeout: no data received for {secs} seconds",
+                    url,
+                    model,
+                    auth.label()
+                );
+            }
+        };
+        let chunk_str = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&chunk_str);
+
+        while let Some(event) = crate::provider::anthropic::parse_sse_event(&mut buffer) {
+            let events = crate::provider::anthropic::process_sse_event(
+                &event,
+                &mut current_tool_use,
+                &mut current_thinking_block,
+                &mut input_tokens,
+                &mut output_tokens,
+                &mut cache_read_input_tokens,
+                &mut cache_creation_input_tokens,
+                false, // is_oauth — never for compat endpoints
+            );
+            for stream_event in events {
+                if let StreamEvent::Error { ref message, .. } = stream_event
+                    && is_retryable_error(&message.to_lowercase())
+                {
+                    anyhow::bail!("Retryable stream error: {}", message);
+                }
+                if tx.send(Ok(stream_event)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Send final token usage if available
+    if input_tokens.is_some() || output_tokens.is_some() {
+        let _ = tx
+            .send(Ok(StreamEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            }))
+            .await;
+    }
+
+    Ok(())
+}
+
 pub(crate) struct OpenRouterStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     pub(crate) buffer: String,

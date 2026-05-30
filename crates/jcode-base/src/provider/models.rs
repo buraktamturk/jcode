@@ -591,7 +591,7 @@ fn anthropic_model_catalog_refresh_throttled(scope: &str) -> bool {
 
 pub fn should_refresh_openai_model_catalog() -> bool {
     // Offline mode disables every startup network operation (issue #24).
-    if std::env::var("JCODE_OFFLINE").is_ok() {
+    if std::env::var("JCODE_OFFLINE").is_ok() || std::env::var("JCODE_NO_CATALOG").is_ok() {
         return false;
     }
     if account_model_cache_is_fresh() {
@@ -604,7 +604,7 @@ pub fn should_refresh_openai_model_catalog() -> bool {
 }
 
 pub fn should_refresh_anthropic_model_catalog() -> bool {
-    if std::env::var("JCODE_OFFLINE").is_ok() {
+    if std::env::var("JCODE_OFFLINE").is_ok() || std::env::var("JCODE_NO_CATALOG").is_ok() {
         return false;
     }
     let scope = current_anthropic_catalog_scope();
